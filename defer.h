@@ -1,9 +1,18 @@
 #ifndef DEFER_H
 #define DEFER_H
 
+#include "ArrayBuffer.h"
+#include "Allocator.h"
 #include <setjmp.h>
 #include <assert.h>
-#include <stdbool.h>
+#include <pthread.h>
+#include <signal.h>
+#include "VirtualAllocator.h"
+
+#include <stdatomic.h>
+#if defined(__unix__) || defined(__linux__)
+#   include <unistd.h>
+#endif
 
 #ifndef CONCAT_
 #   define CONCAT_(a,b) a##b
@@ -17,58 +26,105 @@
 #   define LINE_IDENT(name) CONCAT(name, __LINE__)
 #endif
 
+
 #ifndef scoped_expression
-#define scoped_expression(var__, ...) \
-    for (bool LINE_IDENT(__once_guard) = 1; LINE_IDENT(__once_guard); LINE_IDENT(__once_guard) = false) \
-    for (var__;LINE_IDENT(__once_guard);LINE_IDENT(__once_guard) = false, ({__VA_ARGS__;}))
+#   define scoped_expression(var__, ...) \
+        for (volatile bool LINE_IDENT(__once_guard) = true; LINE_IDENT(__once_guard); LINE_IDENT(__once_guard) = false) \
+        for (var__; LINE_IDENT(__once_guard); LINE_IDENT(__once_guard) = false, ({__VA_ARGS__;}))
 #endif
 
-#ifndef DEFER_STACK_SIZE
-#   define DEFER_STACK_SIZE 1024
+#ifndef finalizer_expression
+#   define finalizer_expression(expression__) scoped_expression(, expression__)
 #endif
 
-_Thread_local jmp_buf _TLG_defer_stack[DEFER_STACK_SIZE];
-_Thread_local jmp_buf _TLG_return_address;
-_Thread_local bool _TLG_should_return = false;
-_Thread_local int _TLG_defer_stack_pointer = -1;
+#define aligned_to(size__, alignment__) (((size__) + (alignment__)-1) & ~((alignment__)-1))
 
+constexpr size_t GB = 1 << 30;
+constexpr size_t MB = 1 << 20;
+constexpr size_t KB = 1 << 10;
 
-static int __defer_stack_unwind(const int sf, const int sp) {
-    if (sp > sf) longjmp(_TLG_defer_stack[sp], 1);
-    if (_TLG_should_return) longjmp(_TLG_return_address, 1);
-    return 1;
+_Thread_local static jmp_buf *_tls_defer_stack = nullptr;
+_Thread_local static int _tls_defer_stack_pointer = -1;
+_Thread_local static size_t _tls_defer_cap = 0;
+
+_Thread_local static jmp_buf _tls_defer_anchor_buf;
+_Thread_local static bool _tls_defer_jump_anchor = false;
+
+#if defined(_WIN32)
+#   include <windows.h>
+#elif defined(__unix__) || defined(__linux__)
+#   include <unistd.h>
+#endif
+
+static pthread_mutex_t __initialization_mutex = PTHREAD_MUTEX_INITIALIZER;
+_Thread_local static bool defer_runtime_initialized = false;
+
+static void _defer_runtime_init() {
+    if (defer_runtime_initialized) return;
+    pthread_mutex_lock(&__initialization_mutex);
+    if (_tls_defer_stack == nullptr) {
+        _tls_defer_stack = virtual_alloc(
+            nullptr,
+            GB,
+            VMEM_RESERVE,
+            VMEM_READ_WRITE
+        );
+    }
+    defer_runtime_initialized = true;
+    pthread_mutex_unlock(&__initialization_mutex);
+}
+
+static void _defer_reserve_stack(const size_t size [[maybe_unused]]) {
+    #if defined(_WIN32)
+    const size_t to_commit = virtual_page_size();
+    if (size >= _tls_defer_cap) {
+        void *adress = _tls_defer_stack + _tls_defer_cap;
+        virtual_alloc(adress, to_commit, VMEM_COMMIT, VMEM_READ_WRITE);
+        _tls_defer_cap += to_commit;
+    }
+    #endif
+}
+
+static int _defer_stack_unwind(jmp_buf *stack, const int sf, const int sp, const int code) {
+    if (sp >= sf) { longjmp(stack[sp], 1); }
+    if (_tls_defer_jump_anchor) {
+        _tls_defer_jump_anchor = false;
+        longjmp(_tls_defer_anchor_buf, code);
+    }
+    return sp;
 }
 
 #define defer_scope \
-for (\
-    int __defer_stack_frame = _TLG_defer_stack_pointer, __once_guard = 1; __once_guard; __once_guard = 0,\
-    __defer_stack_unwind(__defer_stack_frame, _TLG_defer_stack_pointer)\
-)\
-scoped_expression() /* Safety measure to prevent a wild break from bipassing the finalisers */
+    scoped_expression(_defer_runtime_init())\
+    scoped_expression(_defer_reserve_stack(_tls_defer_stack_pointer + 1))\
+    scoped_expression(\
+        int __sf = ++_tls_defer_stack_pointer,\
+        _defer_stack_unwind(_tls_defer_stack, __sf + 1, _tls_defer_stack_pointer, 1)\
+    )\
+    if (setjmp(_tls_defer_stack[_tls_defer_stack_pointer]) == 1)\
+        _tls_defer_stack_pointer -= 1;\
+    else
+#define defer \
+    scoped_expression(_defer_reserve_stack(_tls_defer_stack_pointer + 1))\
+    if (setjmp(_tls_defer_stack[++_tls_defer_stack_pointer]) == 1)\
+        finalizer_expression(_defer_stack_unwind(_tls_defer_stack, __sf, _tls_defer_stack_pointer, 1))\
+        scoped_expression(_tls_defer_stack_pointer -= 1)
 
-#define defer(code__) \
-({\
-    assert(_TLG_defer_stack_pointer < DEFER_STACK_SIZE && "Maximum defer depth exceeded what are you doing?"); \
-    if (setjmp(_TLG_defer_stack[++_TLG_defer_stack_pointer]) != 0) { \
-        _TLG_defer_stack_pointer--; \
-        code__; \
-        continue; \
+#define defer_break \
+    if (setjmp(_tls_defer_anchor_buf) == 0)\
+    {\
+        _tls_defer_jump_anchor = true;\
+        _defer_stack_unwind(_tls_defer_stack, __sf, _tls_defer_stack_pointer, 1);\
     }\
-})
-
-#define defer_return(...) \
-({\
-    _TLG_should_return = true; \
-    if (setjmp(_TLG_return_address) != 0) { \
-        _TLG_should_return = false; \
-        return __VA_ARGS__; \
-    }\
-    continue; \
-})
+    else\
+        finalizer_expression(longjmp(_tls_defer_stack[__sf], 1))\
+        scoped_expression(_tls_defer_stack_pointer++)
 
 #define using(before__, after__) \
     defer_scope\
         scoped_expression(before__)\
-        scoped_expression(defer(after__))
+        scoped_expression( ({defer { after__; };}) )
+
+#define using_break defer_break
 
 #endif //DEFER_H
