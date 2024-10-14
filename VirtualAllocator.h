@@ -2,10 +2,16 @@
 #define VIRTUALALLOCATOR_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifndef VMEM_API
 #   define VMEM_API static inline
 #endif
+
+#ifndef typeof_member
+#   define typeof_member(type__, member__) typeof(((type__*)0)->member__)
+#endif
+
 
 enum vmem_protection;
 enum vmem_alloc_type; // Flags
@@ -135,69 +141,4 @@ size_t virtual_granularity() {
 }
 
 #endif
-
-struct virtual_arena_t {
-    struct allocator_t allocator;
-    uintptr_t min_address;
-    uintptr_t max_address;
-    uintptr_t current_address;
-    #if defined(_WIN32)
-    uintptr_t commited;
-    #endif
-};
-
-VMEM_API struct virtual_arena_t virtual_arena_init(size_t size);
-
-VMEM_API void *virtual_arena_alloc(struct virtual_arena_t *allocator, size_t size);
-
-VMEM_API void virtual_arena_dealloc(const struct virtual_arena_t *allocator, void *ptr);
-
-VMEM_API void virtual_arena_clear(struct virtual_arena_t *allocator);
-
-struct virtual_arena_t virtual_arena_init(const size_t size) {
-    constexpr enum vmem_protection rw = VMEM_READ_WRITE;
-    constexpr enum vmem_alloc_type reserve = VMEM_RESERVE;
-    const uintptr_t address = (uintptr_t) virtual_alloc(nullptr, size, reserve, rw);
-    return (struct virtual_arena_t){
-        .allocator = {
-            .alloc = (typeof_member(struct allocator_t, alloc)) virtual_arena_alloc,
-            .dealloc = (typeof_member(struct allocator_t, dealloc)) virtual_arena_dealloc
-        },
-        .min_address = (uintptr_t) address,
-        .max_address = (uintptr_t) address + size,
-        .current_address = (uintptr_t) address,
-    };
-}
-
-void *virtual_arena_alloc(struct virtual_arena_t *allocator, const size_t size) {
-    if (allocator->current_address + size > allocator->max_address) {
-        return nullptr;
-    }
-    constexpr enum vmem_protection rw = VMEM_READ_WRITE;
-    constexpr enum vmem_alloc_type commit = VMEM_COMMIT;
-    auto const ptr = (void *) allocator->current_address;
-    allocator->current_address += size;
-    #if defined(_WIN32)
-    if (allocator->current_address >= allocator->commited) {
-        const size_t page_size = virtual_page_size();
-        virtual_alloc(ptr, page_size, commit, rw);
-        allocator->commited += page_size;
-    }
-    #endif
-    return ptr;
-}
-
-void virtual_arena_dealloc(const struct virtual_arena_t *allocator, void *ptr) {
-    const uintptr_t address = (uintptr_t) ptr;
-    assert(address >= allocator->min_address &&
-        address <= allocator->max_address &&
-        "Pointer is out of the reserved region");
-}
-
-void virtual_arena_clear(struct virtual_arena_t *allocator) {
-    const size_t size = allocator->max_address - allocator->min_address;
-    virtaul_dealloc((void *) allocator->min_address, size, VMEM_DECOMMIT);
-    allocator->current_address = allocator->min_address;
-}
-
 #endif //VIRTUALALLOCATOR_H

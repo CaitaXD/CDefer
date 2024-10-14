@@ -1,12 +1,8 @@
 #ifndef DEFER_H
 #define DEFER_H
 
-#include "ArrayBuffer.h"
-#include "Allocator.h"
 #include <setjmp.h>
-#include <assert.h>
 #include <pthread.h>
-#include <signal.h>
 #include "VirtualAllocator.h"
 
 #include <stdatomic.h>
