@@ -2,6 +2,7 @@
 Go style defer (GCC|Clang only imagine using MSVC) uses setjmp|longjmp and some criminal macros
 
 Example:
+```
 defer_scope {
   defer {
     printf("End Simple Scope\n");
@@ -9,4 +10,5 @@ defer_scope {
   printf("Begin Simple Scope\n");
   printf("\tHello World!\n");
 }
+```
     
